@@ -2,13 +2,36 @@
 
 本仓库提供 Cisco AnyConnect (ocserv) 的一键自动编译部署与全自动优化脚本，基于开源的 **ocserv 1.5.0** 最新版构建，完美支持高并发，并自带极为强大的路由分流系统。
 
-> ⚠️ **版本架构提示**：1.5.0 版是专注于极致性能与严苛安全协议的纯血 AnyConnect 版本，**不再支持兼容 OpenVPN 客户端**。如果您有极强的 OpenVPN 客户端兼容需求，请使用我们的 **[ocserv88-main (1.2.4 稳定增强版)](https://github.com/lgdglgc/ocserv88)**。
->   
+> ⚠️ **版本架构提示**：1.5.0 版是专注于极致性能与严苛安全协议的纯血 AnyConnect 版本，**不再支持兼容 OpenVPN 客户端**。如果您有极强的 OpenVPN 客户端兼容需求，请使用我们的 **[ocserv88-main (1.2.4 稳定增强版)](https://github.com/lgdglgc/ocserv88)**。 
+
+---  
+## 改版注意事项
 > 该版本是改编自上一版本，对service中iptables的逻辑处理进行了优化 （不再flush & restore）。  
 >
 > 相关的conf文件也一起上传，嫌麻烦可以直接照搬。ocserv-config.zip中 scripts/connect-scripts 是用来统计用户的登录行为，日志存放在logs目录，需要执行权限不然ocserv报错。同时压缩包里的证书需要替换成自己的，不然ocserv报错。
+>
+> 默认没有对ufw防火墙操作，有防火墙的请自己操作放行 ufw enable && ufw allow 10443/tcp && ufw reload && ufw status verbose
 
----
+
+针对小内存机器，一定要执行之前创建swap
+```
+mkdir /www
+swapFile="/www/swap"
+dd if=/dev/zero of=$swapFile bs=1M count=1025
+chmod 600 $swapFile
+mkswap -f $swapFile
+swapon $swapFile
+echo "$swapFile    swap    swap    defaults    0 0" >> /etc/fstab
+
+sysctl -p
+sed -i.bak '/^[[:space:]]*vm\.swappiness[[:space:]]*=/d' /etc/sysctl.conf && echo 'vm.swappiness = 10' >> /etc/sysctl.conf
+sed -i.bak '/^[[:space:]]*net\.ipv4\.ip_forward[[:space:]]*=/d' /etc/sysctl.conf \
+  && echo 'net.ipv4.ip_forward=1' >> /etc/sysctl.conf
+sysctl -p
+cat /proc/sys/vm/swappiness
+```  
+
+---  
 
 ## 🔄 v1.5.0 版本新特性与安全修复
 
