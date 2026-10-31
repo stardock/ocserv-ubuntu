@@ -4,18 +4,19 @@ export PATH
 #=================================================
 #	System Required: Debian/Ubuntu
 #	Description: ocserv AnyConnect
-#	Version: 1.5.0
+#	Version: 1.5.1
 #	Author: SheepKeeperS
 #	Blog: blog.kqsdw.com
 #=================================================
-sh_ver="1.5.0"
+sh_ver="1.5.1"
 file="/usr/local/sbin/ocserv"
 conf_file="/etc/ocserv"
 conf="/etc/ocserv/ocserv.conf"
 passwd_file="/etc/ocserv/ocpasswd"
 log_file="/tmp/ocserv.log"
 ocserv_ver="1.5.0"
-PID_FILE="/var/run/ocserv.pid"
+# 与 systemd unit 中 PIDFile 保持一致（/var/run 是 /run 的软链接，统一写 /run 避免歧义）
+PID_FILE="/run/ocserv.pid"
 
 Green_font_prefix="\033[32m" && Red_font_prefix="\033[31m" && Green_background_prefix="\033[42;37m" && Red_background_prefix="\033[41;37m" && Font_color_suffix="\033[0m"
 Info="${Green_font_prefix}[信息]${Font_color_suffix}"
@@ -51,6 +52,61 @@ check_pid(){
 		PID=""
 	else
 		PID=$(cat ${PID_FILE})
+	fi
+}
+#========== [整合] 安装前创建 ocserv 系统用户与目录 ==========
+Create_ocserv_user(){
+	echo -e "${Info} 正在检查/创建 ocserv 系统用户..."
+	# 幂等：已存在则跳过，避免重复安装报错
+	if ! getent group ocserv >/dev/null 2>&1; then
+		groupadd -r ocserv || echo -e "${Error} 创建 ocserv 用户组失败 !"
+	fi
+	if ! id -u ocserv >/dev/null 2>&1; then
+		useradd -r \
+			-g ocserv \
+			-d /var/lib/ocserv \
+			-s /sbin/nologin \
+			-c "ocserv" \
+			-M \
+			ocserv || echo -e "${Error} 创建 ocserv 用户失败 !"
+	fi
+
+	# -M 只是不自动建家目录，目录本身要存在
+	install -d -o ocserv -g ocserv -m 755 /var/lib/ocserv
+
+	# 配置文件目录必须存在且属主为 ocserv，否则 worker(降权进程) 读取失败
+	mkdir -p /etc/ocserv
+	chown -R ocserv:ocserv /etc/ocserv
+
+	# 验证
+	local pw
+	pw=$(getent passwd ocserv)
+	if [[ -z "${pw}" ]]; then
+		echo -e "${Error} ocserv 系统用户创建失败，后续服务将无法启动 !" && exit 1
+	fi
+	echo -e "${Info} ocserv 系统用户已就绪: ${pw}"
+}
+#========== [整合] 安装前放开 ufw 转发策略 ==========
+Set_ufw_forward(){
+	echo -e "${Info} 正在检查 ufw 转发策略..."
+	# 未安装 ufw 或没有配置文件则直接跳过，不影响安装
+	command -v ufw &>/dev/null || { echo -e "${Tip} 未检测到 ufw，跳过。"; return 0; }
+	[[ -f /etc/default/ufw ]] || { echo -e "${Tip} /etc/default/ufw 不存在，跳过。"; return 0; }
+
+	if grep -q '^DEFAULT_FORWARD_POLICY=' /etc/default/ufw; then
+		sed -i.bak 's/^DEFAULT_FORWARD_POLICY=.*/DEFAULT_FORWARD_POLICY="ACCEPT"/' /etc/default/ufw
+	else
+		# 该行不存在时 sed 会静默失效，这里补一条
+		echo 'DEFAULT_FORWARD_POLICY="ACCEPT"' >> /etc/default/ufw
+	fi
+	grep '^DEFAULT_FORWARD_POLICY' /etc/default/ufw
+
+	# ufw 未启用时 reload 会报错，做了状态判断
+	if ufw status 2>/dev/null | grep -qi "Status: active"; then
+		ufw reload >/dev/null 2>&1
+		ufw status verbose | head -4
+	else
+		echo -e "${Tip} ufw 当前未启用，策略已写好，启用后生效。"
 	fi
 }
 Get_ip(){
@@ -90,13 +146,43 @@ Download_ocserv(){
 		chmod 755 "${conf_file}"
 		chmod 644 "${conf}"
 		chmod 644 "/etc/ocserv/cn_routes.txt"
+		# 新建的配置文件属主仍为 root，需要交还给 ocserv 用户
+		chown -R ocserv:ocserv "${conf_file}" 2>/dev/null
 	else
 		echo -e "${Error} ocserv 编译安装失败，请检查！" && exit 1
 	fi
 }
+#========== [整合] 生成防火墙规则自愈脚本 ==========
+Set_fw_ensure(){
+	cat > /usr/local/sbin/ocserv-fw-ensure << 'EOF'
+#!/usr/bin/env bash
+set -u
+CONF=/etc/ocserv/ocserv.conf
+[[ -r $CONF ]] || exit 0
+getv(){ awk -F= -v k="$1" '$1 ~ "^[[:space:]]*"k"[[:space:]]*$"{gsub(/[[:space:]]/,"",$2);print $2;exit}' "$CONF"; }
+dev=$(getv device);  dev=${dev:-vpn0}
+tcp=$(getv tcp-port); udp=$(getv udp-port)
+wan=$(ip route get 8.8.8.8 2>/dev/null | awk '{for(i=1;i<=NF;i++) if($i=="dev"){print $(i+1);exit}}')
+
+ensure(){ iptables -w -C "$@" 2>/dev/null || iptables -w -A "$@"; }
+[ -n "$tcp" ] && ensure INPUT   -m state --state NEW -m tcp -p tcp --dport "$tcp" -j ACCEPT
+[ -n "$udp" ] && ensure INPUT   -m state --state NEW -m udp -p udp --dport "$udp" -j ACCEPT
+ensure FORWARD -i "$dev" -j ACCEPT
+ensure FORWARD -o "$dev" -m state --state RELATED,ESTABLISHED -j ACCEPT
+if [ -n "$wan" ]; then
+	iptables -w -t nat -C POSTROUTING -o "$wan" -j MASQUERADE 2>/dev/null \
+		|| iptables -w -t nat -A POSTROUTING -o "$wan" -j MASQUERADE
+fi
+exit 0
+EOF
+	chmod +x /usr/local/sbin/ocserv-fw-ensure
+	echo -e "${Info} 防火墙规则自愈脚本已生成: /usr/local/sbin/ocserv-fw-ensure"
+}
 Service_ocserv(){
 	# 检测 systemd 或 SysV init
 	if command -v systemctl &>/dev/null && systemctl --version &>/dev/null; then
+		# 先准备好自愈脚本，再引用它
+		Set_fw_ensure
 		# 写入 systemd unit 文件
 		cat > /etc/systemd/system/ocserv.service << 'EOF'
 [Unit]
@@ -106,9 +192,10 @@ Wants=network-online.target
 
 [Service]
 Type=forking
-PIDFile=/var/run/ocserv.pid
+PIDFile=/run/ocserv.pid
 ExecStart=/usr/local/sbin/ocserv -c /etc/ocserv/ocserv.conf
 ExecStartPost=-/sbin/iptables-restore /etc/iptables.up.rules
+ExecStartPost=-/usr/local/sbin/ocserv-fw-ensure
 ExecReload=/bin/kill -HUP $MAINPID
 KillMode=process
 Restart=on-failure
@@ -118,7 +205,8 @@ LimitNOFILE=51200
 WantedBy=multi-user.target
 EOF
 		systemctl daemon-reload
-		systemctl enable ocserv
+		systemctl enable ocserv >/dev/null 2>&1
+		echo -e "${Info} PIDFile 当前值: $(systemctl show ocserv -p PIDFile 2>/dev/null)"
 		echo -e "${Info} ocserv systemd 服务已配置并设置开机自启 !"
 	else
 		# 降级使用 SysV init
@@ -129,6 +217,28 @@ EOF
 		update-rc.d -f ocserv defaults
 		echo -e "${Info} ocserv SysV init 服务脚本下载完成 !"
 	fi
+}
+#========== [整合] 修复已安装环境的 service 配置 ==========
+Repair_Service(){
+	check_root
+	[[ ! -f /etc/systemd/system/ocserv.service ]] && echo -e "${Error} 未找到 systemd 服务文件，请先安装 ocserv !" && exit 1
+	echo -e "${Info} 正在修正 PIDFile 路径..."
+	sed -i.bak 's#^PIDFile=.*#PIDFile=/run/ocserv.pid#' /etc/systemd/system/ocserv.service
+	grep -n '^PIDFile=' /etc/systemd/system/ocserv.service
+
+	echo -e "${Info} 正在生成防火墙规则自愈脚本..."
+	Set_fw_ensure
+
+	echo -e "${Info} 正在挂载 ExecStartPost..."
+	# 先清掉旧的 ExecStartPost 行，再写入两条，避免重复追加
+	sed -i '/^ExecStartPost=/d' /etc/systemd/system/ocserv.service
+	sed -i '/^PIDFile=/a ExecStartPost=-/sbin/iptables-restore /etc/iptables.up.rules\nExecStartPost=-/usr/local/sbin/ocserv-fw-ensure' /etc/systemd/system/ocserv.service
+
+	systemctl daemon-reload
+	echo -e "${Info} 修复后的关键配置:"
+	grep -nE '^(PIDFile|ExecStartPost)=' /etc/systemd/system/ocserv.service
+	echo -e "${Info} 等待 systemd 重新加载后读取 PIDFile: $(systemctl show ocserv -p PIDFile 2>/dev/null)"
+	echo -e "${Tip} 建议执行：重启 ocserv 使配置生效。"
 }
 rand(){
 	min=10000
@@ -162,6 +272,7 @@ Generate_SSL(){
 				chmod 755 /etc/ocserv /etc/ocserv/ssl
 				chmod 644 /etc/ocserv/ssl/server-cert.pem 2>/dev/null
 				chmod 600 /etc/ocserv/ssl/server-key.pem 2>/dev/null
+				chown -R ocserv:ocserv /etc/ocserv/ssl 2>/dev/null
 				echo -e "${Info} 受信任证书配置完成！"
 				return 0
 			else
@@ -216,6 +327,7 @@ tls_www_server' > server.tmpl
 	chmod 755 /etc/ocserv /etc/ocserv/ssl
 	chmod 644 /etc/ocserv/ssl/ca-cert.pem /etc/ocserv/ssl/server-cert.pem 2>/dev/null
 	chmod 600 /etc/ocserv/ssl/ca-key.pem /etc/ocserv/ssl/server-key.pem 2>/dev/null
+	chown -R ocserv:ocserv /etc/ocserv/ssl 2>/dev/null
 	cd .. && rm -rf /tmp/ssl/
 }
 # 统一依赖包列表（Debian/Ubuntu 通用）
@@ -262,6 +374,12 @@ Install_ocserv(){
 	[[ -e ${file} ]] && echo -e "${Error} ocserv 已安装，请检查 !" && exit 1
 	echo -e "${Info} 开始安装/配置 依赖..."
 	Installation_dependency
+	# 必须在下载配置文件之前：负责建用户、建 /etc/ocserv 并 chown
+	echo -e "${Info} 开始创建 ocserv 系统用户/目录..."
+	Create_ocserv_user
+	# 依赖装完后 ufw 可能才装好，所以放在这里
+	echo -e "${Info} 开始设置 ufw 转发策略..."
+	Set_ufw_forward
 	echo -e "${Info} 开始下载/安装 配置文件..."
 	Download_ocserv
 	echo -e "${Info} 开始下载/安装 服务脚本(init)..."
@@ -276,6 +394,10 @@ Install_ocserv(){
 	echo -e "${Info} 开始添加 iptables防火墙规则..."
 	Add_iptables
 	echo -e "${Info} 开始保存 iptables防火墙规则..."
+	Save_iptables
+	# 端口可能刚被 Set_Config 改过，最后补齐 FORWARD / 转发规则再存一次
+	echo -e "${Info} 开始补齐 FORWARD/转发规则..."
+	/usr/local/sbin/ocserv-fw-ensure 2>/dev/null || true
 	Save_iptables
 	echo -e "${Info} 所有步骤 安装完毕，开始启动..."
 	Start_ocserv
@@ -332,6 +454,9 @@ Set_ocserv(){
 	Del_iptables
 	Add_iptables
 	Save_iptables
+	# [整合] 配置改动后同步刷新 FORWARD/NAT 规则（例如改过 device 名）
+	/usr/local/sbin/ocserv-fw-ensure 2>/dev/null || true
+	Save_iptables
 	echo "是否重启 ocserv ? (Y/n)"
 	read -e -p "(默认: Y):" yn
 	[[ -z ${yn} ]] && yn="y"
@@ -343,7 +468,7 @@ Set_username(){
 	echo "请输入 要添加的VPN账号 用户名"
 	read -e -p "(默认: admin):" username
 	[[ -z "${username}" ]] && username="admin"
-	echo && echo -e "	用户名 : ${Red_font_prefix}${username}${Font_color_suffix}" && echo
+	echo && echo -e "\t用户名 : ${Red_font_prefix}${username}${Font_color_suffix}" && echo
 }
 Set_passwd(){
 	local default_pass
@@ -363,7 +488,7 @@ Set_tcp_port(){
 	echo $((${set_tcp_port}+0)) &>/dev/null
 	if [[ $? -eq 0 ]]; then
 		if [[ ${set_tcp_port} -ge 1 ]] && [[ ${set_tcp_port} -le 65535 ]]; then
-			echo && echo -e "	TCP端口 : ${Red_font_prefix}${set_tcp_port}${Font_color_suffix}" && echo
+			echo && echo -e "\tTCP端口 : ${Red_font_prefix}${set_tcp_port}${Font_color_suffix}" && echo
 			break
 		else
 			echo -e "${Error} 请输入正确的数字！"
@@ -382,7 +507,7 @@ Set_udp_port(){
 	echo $((${set_udp_port}+0)) &>/dev/null
 	if [[ $? -eq 0 ]]; then
 		if [[ ${set_udp_port} -ge 1 ]] && [[ ${set_udp_port} -le 65535 ]]; then
-			echo && echo -e "	UDP端口 : ${Red_font_prefix}${set_udp_port}${Font_color_suffix}" && echo
+			echo && echo -e "\tUDP端口 : ${Red_font_prefix}${set_udp_port}${Font_color_suffix}" && echo
 			break
 		else
 			echo -e "${Error} 请输入正确的数字！"
@@ -397,6 +522,7 @@ Set_Config(){
 	Set_passwd
 	printf "%s\n%s\n" "${userpass}" "${userpass}" | ocpasswd -c ${passwd_file} ${username}
 	chmod 600 ${passwd_file}
+	chown ocserv:ocserv ${passwd_file} 2>/dev/null
 	Set_tcp_port
 	Set_udp_port
 	sed -i 's/tcp-port = '"$(echo ${tcp_port})"'/tcp-port = '"$(echo ${set_tcp_port})"'/g' ${conf}
@@ -438,6 +564,7 @@ Add_User(){
 	[[ ! -z ${user_status} ]] && echo -e "${Error} 用户名已存在 ![ ${username} ]" && exit 1
 	printf "%s\n%s\n" "${userpass}" "${userpass}" | ocpasswd -c ${passwd_file} ${username}
 	chmod 600 ${passwd_file}
+	chown ocserv:ocserv ${passwd_file} 2>/dev/null
 	user_status=$(grep "^${username}:" "${passwd_file}")
 	if [[ ! -z ${user_status} ]]; then
 		echo -e "${Info} 账号添加成功 ![ ${username} ]"
@@ -562,8 +689,13 @@ Uninstall_ocserv(){
 		if [[ -e ${conf} ]]; then
 			tcp_port=$(cat ${conf}|grep "tcp-port ="|awk -F ' = ' '{print $NF}')
 			udp_port=$(cat ${conf}|grep "udp-port ="|awk -F ' = ' '{print $NF}')
+			# [整合] 同时清理 fw-ensure 写入的 FORWARD 规则
+			vpn_dev=$(awk -F= '/^[[:space:]]*device[[:space:]]*$/{gsub(/[[:space:]]/,"",$2);print $2;exit}' ${conf})
+			vpn_dev=${vpn_dev:-vpn0}
 			[[ -n "${tcp_port}" ]] && iptables -D INPUT -m state --state NEW -m tcp -p tcp --dport ${tcp_port} -j ACCEPT 2>/dev/null
 			[[ -n "${udp_port}" ]] && iptables -D INPUT -m state --state NEW -m udp -p udp --dport ${udp_port} -j ACCEPT 2>/dev/null
+			iptables -D FORWARD -i ${vpn_dev} -j ACCEPT 2>/dev/null
+			iptables -D FORWARD -o ${vpn_dev} -m state --state RELATED,ESTABLISHED -j ACCEPT 2>/dev/null
 			Save_iptables
 		fi
 
@@ -582,6 +714,7 @@ Uninstall_ocserv(){
 		rm -f /usr/local/bin/occtl
 		rm -f /usr/local/bin/ocpasswd
 		rm -f /usr/local/bin/ocserv-fw
+		rm -f /usr/local/sbin/ocserv-fw-ensure
 		rm -f /usr/local/sbin/ocserv
 		rm -f /usr/local/share/man/man8/ocserv.8
 		rm -f /usr/local/share/man/man8/ocpasswd.8
@@ -612,6 +745,7 @@ over(){
 	rm -f /usr/local/bin/occtl
 	rm -f /usr/local/bin/ocpasswd
 	rm -f /usr/local/bin/ocserv-fw
+	rm -f /usr/local/sbin/ocserv-fw-ensure
 	rm -f /usr/local/sbin/ocserv
 	rm -f /usr/local/share/man/man8/ocserv.8
 	rm -f /usr/local/share/man/man8/ocpasswd.8
@@ -759,6 +893,7 @@ echo && echo -e " ocserv 一键安装管理脚本 ${Red_font_prefix}[v${sh_ver}]
  ${Green_font_prefix}8.${Font_color_suffix} 修改 配置文件
  ${Green_font_prefix}9.${Font_color_suffix} 查看 日志信息
  ${Green_font_prefix}10.${Font_color_suffix} 切换 路由模式
+ ${Green_font_prefix}11.${Font_color_suffix} 修复 服务配置(已有安装)
 ————————————" && echo
 if [[ -e ${file} ]]; then
 	check_pid
@@ -771,7 +906,7 @@ else
 	echo -e " 当前状态: ${Red_font_prefix}未安装${Font_color_suffix}"
 fi
 echo
-read -e -p " 请输入数字 [0-10]:" num
+read -e -p " 请输入数字 [0-11]:" num
 case "$num" in
 	0)
 	Update_Shell
@@ -806,7 +941,10 @@ case "$num" in
 	10)
 	Toggle_Route
 	;;
-	*)
-	echo "请输入正确数字 [0-10]"
+	11)
+	Repair_Service
 	;;
-esac 
+	*)
+	echo "请输入正确数字 [0-11]"
+	;;
+esac
