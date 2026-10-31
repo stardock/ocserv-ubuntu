@@ -10,7 +10,7 @@
 >
 > 相关的conf文件也一起上传，嫌麻烦可以直接照搬。ocserv-config.zip中 scripts/connect-scripts 是用来统计用户的登录行为，日志存放在logs目录，需要执行权限不然ocserv报错。同时压缩包里的证书需要替换成自己的，不然ocserv报错。
 >
-> 默认没有对ufw防火墙操作，有防火墙的请自己操作放行 ufw enable && ufw allow 10443/tcp && ufw reload && ufw status verbose
+> 默认没有对ufw防火墙操作，有防火墙的请自己操作放行 ufw enable && ufw allow ssh && ufw allow 10443/tcp && ufw reload && ufw status verbose
 
 
 针对小内存机器，一定要执行之前创建swap
