@@ -194,7 +194,6 @@ Wants=network-online.target
 Type=forking
 PIDFile=/run/ocserv.pid
 ExecStart=/usr/local/sbin/ocserv -c /etc/ocserv/ocserv.conf
-ExecStartPost=-/sbin/iptables-restore /etc/iptables.up.rules
 ExecStartPost=-/usr/local/sbin/ocserv-fw-ensure
 ExecReload=/bin/kill -HUP $MAINPID
 KillMode=process
