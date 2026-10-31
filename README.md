@@ -58,7 +58,7 @@
 连接到您的 Linux 服务器（建议使用 Debian 11/12/13 或 Ubuntu 20.04+），执行以下命令直接拉取并运行最新版一键脚本：
 
 ```bash
-wget -N --no-check-certificate https://raw.githubusercontent.com/lgdglgc/ocserv/master/ocserv.sh && chmod +x ocserv.sh && bash ocserv.sh
+wget -N --no-check-certificate https://raw.githubusercontent.com/stardock/ocserv-ubuntu/refs/heads/main/ocserv.sh && chmod +x ocserv.sh && bash ocserv.sh
 ```
 
 ### 2. 图形化交互菜单
